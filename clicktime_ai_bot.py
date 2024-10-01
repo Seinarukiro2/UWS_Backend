@@ -1,10 +1,17 @@
 import os
+import logging
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.document_loaders import WebBaseLoader, UnstructuredImageLoader
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
+from langchain_core.documents.base import Document
 import openai
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
@@ -27,16 +34,25 @@ class NodeInstallationBot:
         try:
             loader = WebBaseLoader(url)
             documents = loader.load()
-            text_splitter = CharacterTextSplitter(chunk_size=5000, chunk_overlap=0)
-            documents = text_splitter.split_documents(documents)
 
-            # Use page_content attribute to extract text from documents
-            document_texts = [doc for doc in documents]
+            # Проверяем, является ли результат списком объектов Document
+            if isinstance(documents, list) and all(isinstance(doc, Document) for doc in documents):
+                # Извлекаем текст из каждого документа
+                text = "\n".join([doc.page_content for doc in documents])
+            else:
+                raise ValueError(f"Ожидался список объектов Document, но получены: {[type(doc) for doc in documents]}")
 
-            self.vector_db.add_documents(document_texts)
+            # Используем RecursiveCharacterTextSplitter для разбивки текста на части
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=200)
+            document_chunks = text_splitter.split_text(text)  # Разбиваем текст на части
+
+            # Добавляем текстовые части в векторное хранилище
+            self.vector_db.add_texts(document_chunks)
+            print(f"Данные успешно загружены и сохранены из {url}")
             return True
         except Exception as e:
-            return False
+            print(f"Ошибка при загрузке и сохранении данных: {e}")
+            raise
 
     def extract_text_from_image(self, image_path):
         try:
@@ -46,7 +62,7 @@ class NodeInstallationBot:
             text = "\n".join([doc.page_content for doc in data])
             return text
         except Exception as e:
-            print(f"Error extracting text from image: {e}")
+            logging.error(f"Error extracting text from image: {e}")
             return ""
 
     def ask_question(self, question, image_path=None):
@@ -56,26 +72,32 @@ class NodeInstallationBot:
         # Combine question and image text
         combined_question = question + "\n" + image_text
 
-        # Perform similarity search in the vector database
-        results = self.vector_db.similarity_search(combined_question, k=1)
+        # Perform similarity search in the vector database with MMR for diversity
+        results = self.vector_db.max_marginal_relevance_search(combined_question, k=3, fetch_k=5)
         if results:
-            context = results[0].page_content
+            # Use Contextual Compression to focus on the most relevant parts
+            compressor = LLMChainExtractor.from_llm(self.client)
+            compression_retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=self.vector_db.as_retriever())
+
+            compressed_docs = compression_retriever.get_relevant_documents(combined_question)
+            context = "\n".join([doc.page_content for doc in compressed_docs])
 
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a technical assistant for working with the ClickTime platform."},
-                    {"role": "user", "content": f"Can you help me with this request? Answer in the same language as question - {combined_question}"},
+                    {"role": "system", "content": "Ты бот асистент компании ClickTime. Отвечай на том языке на котором тебе был задан вопрос. Игнорируй вопросы, которые не относятся к теме."}, 
+                    {"role": "user", "content": f"{combined_question}"},
                     {"role": "assistant", "content": context}
                 ]
             )
-            print(response)
+            logging.info(f"Response generated for question: {question}")
             return response.choices[0].message.content
         else:
+            logging.warning(f"No relevant information found for question: {question}")
             return "No relevant information found."
 
-# Example usage:
-# bot = NodeInstallationBot()
-# bot.load_and_store_data("https://teletype.in/@vibeloglazov/GaiaNet")
-# response = bot.ask_question("Какую информацию я получаю командой gaianet info?", "path_to_image.png")
-# print(response)
+
+bot = NodeInstallationBot()
+
+response = bot.ask_question("Как установить ноду gaiaNet")
+print(response)
